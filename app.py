@@ -1,5 +1,5 @@
 """
-Slice 1 — the shop stamp ritual (TASK L3C).
+Slice 1 — the shop stamp ritual (TASK L3C), wrapped by slice 2 multi-channel.
 
 A customer at a soft-serve shop scans a QR code on the counter stand.
 LINE opens the TASK official account chat with a prefilled STAMP:<shop-code>
@@ -7,19 +7,24 @@ message. The customer taps send; this service verifies the LINE signature,
 records the stamp (one per user per shop per day), and replies with a
 Flex Message stamp card showing progress toward 5.
 
+Slice 2: one backend serves many LINE channels. Each webhook event carries a
+`destination` (the bot user ID of the receiving OA); channels.py maps it to a
+registry entry with that channel's secrets (from env), theme, enabled switch,
+and optional shop subset. The stamp engine below is unchanged.
+
 Env vars:
-  CHANNEL_SECRET        LINE channel secret (default: dev-secret-placeholder)
-  CHANNEL_ACCESS_TOKEN  LINE channel access token (default: unset -> replies skipped)
-  OA_BASIC_ID           LINE OA basic ID for QR links (default: dev-oa-basic-id)
-  STAMPS_ENABLED        "true" (default) | "false" — Law 2 feature switch
-  STAMPS_DB             SQLite path (default: ./stamps.db)
-  DRY_RUN_REPLY         "1" -> skip LINE HTTP call; webhook response includes
-                        the Flex payload under dev_flex_preview (dev/test only)
+  CHANNELS_PATH           registry file (default: ./channels.json); read per
+                          webhook, so edits apply without a restart
+  CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN
+                          legacy single-channel secret env names; the registry
+                          points at them via secret_env/token_env per channel
+  OA_BASIC_ID             LINE OA basic ID for QR links (default: dev-oa-basic-id)
+  STAMPS_ENABLED          "true" (default) | "false" — Law 2 global switch
+  STAMPS_DB               SQLite path (default: ./stamps.db)
+  DRY_RUN_REPLY           "1" -> skip LINE HTTP call; webhook response includes
+                          the Flex payload under dev_flex_preview (dev/test only)
 """
 
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -31,11 +36,22 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from channels import (
+    DEFAULT_THEME,
+    get_secret,
+    get_token,
+    load_channels,
+    resolve_channel,
+    verify_signature,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("slice1")
 
 # ---------------------------------------------------------------- config ---
 
+# Legacy single-channel secret names; the registry's secret_env/token_env
+# point here for the default channel, and per-channel names for the rest.
 CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET", "dev-secret-placeholder")
 CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN", "")
 OA_BASIC_ID = os.environ.get("OA_BASIC_ID", "dev-oa-basic-id")
@@ -51,12 +67,7 @@ LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 STAMP_RE = re.compile(r"^\s*stamp\s*:\s*([A-Za-z0-9_-]+)\s*$", re.IGNORECASE)
 
-SATO_LINE = (
-    "A quiet moment worth remembering doesn't need fanfare — "
-    "just fresh milk and where you stand."
-)
-
-app = FastAPI(title="TASK L3C — slice 1: stamp ritual")
+app = FastAPI(title="TASK L3C — slice 2: multi-channel stamp ritual")
 
 
 # ------------------------------------------------------------------ db ---
@@ -163,27 +174,26 @@ def db_count_for_test(user_id: str, shop_code: str | None = None) -> int:
 
 
 # ------------------------------------------------------------- security ---
-
-def verify_signature(body: bytes, signature: str) -> bool:
-    """HMAC-SHA256 of the raw body, base64-encoded, constant-time compare."""
-    if not signature:
-        return False
-    mac = hmac.new(CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
-    expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+# (signature verification lives in channels.py so the registry can use it too)
 
 
 # ---------------------------------------------------------- flex card ---
 
-def build_stamp_flex(shop, total: int) -> dict:
-    """Flex Message: shop names, progress circles toward GOAL_STAMPS, Sato line."""
+def build_stamp_flex(shop, total: int, theme: dict | None = None) -> dict:
+    """Flex Message: shop names, progress circles toward GOAL_STAMPS, Sato line.
+
+    Theme (per channel): accent color for filled circles, header text, and a
+    Sato line variant. Defaults keep slice-1's look.
+    """
+    theme = theme or DEFAULT_THEME
+    accent = theme.get("accent", DEFAULT_THEME["accent"])
     filled = min(total, GOAL_STAMPS)
     circles = [
         {
             "type": "text",
             "text": "●" if i < filled else "○",
             "size": "xl",
-            "color": "#E8A33D" if i < filled else "#D8D8D8",
+            "color": accent if i < filled else "#D8D8D8",
             "flex": 1,
             "align": "center",
         }
@@ -201,7 +211,7 @@ def build_stamp_flex(shop, total: int) -> dict:
                 "contents": [
                     {
                         "type": "text",
-                        "text": "TASK スタンプ",
+                        "text": theme.get("header", DEFAULT_THEME["header"]),
                         "size": "xs",
                         "color": "#8A8A8A",
                     },
@@ -236,7 +246,7 @@ def build_stamp_flex(shop, total: int) -> dict:
                     {"type": "separator"},
                     {
                         "type": "text",
-                        "text": SATO_LINE,
+                        "text": theme.get("sato_line", DEFAULT_THEME["sato_line"]),
                         "size": "sm",
                         "color": "#555555",
                         "wrap": True,
@@ -254,12 +264,13 @@ def text_message(text: str) -> dict:
 
 # ------------------------------------------------------------ reply ---
 
-def send_reply(reply_token: str, messages: list) -> dict:
+def send_reply(reply_token: str, messages: list, token: str) -> dict:
     """
-    Send via LINE reply API. With no/placeholder credentials the call is
-    skipped (dev mode) — never crashes, never logs secrets.
+    Send via LINE reply API using the given channel's access token.
+    With no/placeholder token the call is skipped (dev mode) — never
+    crashes, never logs secrets.
     """
-    if DRY_RUN_REPLY or not CHANNEL_ACCESS_TOKEN or CHANNEL_ACCESS_TOKEN.startswith("dev-"):
+    if DRY_RUN_REPLY or not token or token.startswith("dev-"):
         alt = next((m.get("altText", m.get("text", "")) for m in messages), "")
         log.info("reply skipped (dev mode, no live credentials): %s", alt[:80])
         return {"dry_run": True}
@@ -267,7 +278,7 @@ def send_reply(reply_token: str, messages: list) -> dict:
         r = requests.post(
             LINE_REPLY_URL,
             headers={
-                "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN,
+                "Authorization": "Bearer " + token,
                 "Content-Type": "application/json",
             },
             json={"replyToken": reply_token, "messages": messages},
@@ -297,6 +308,22 @@ def health():
         "ok": True,
         "stamps_enabled": STAMPS_ENABLED,
         "dry_run_reply": DRY_RUN_REPLY,
+        "channels": len(load_channels()),
+    }
+
+
+def legacy_channel() -> dict:
+    """Slice-1 fallback when the registry is missing/unreadable."""
+    return {
+        "id": "legacy",
+        "destination": "",
+        "basic_id": OA_BASIC_ID,
+        "display_name": "legacy",
+        "enabled": True,
+        "secret_env": "CHANNEL_SECRET",
+        "token_env": "CHANNEL_ACCESS_TOKEN",
+        "theme": dict(DEFAULT_THEME),
+        "shops": None,
     }
 
 
@@ -305,16 +332,26 @@ async def webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
 
-    if not verify_signature(body, signature):
-        # Never log the secret or the received signature value.
-        log.warning("rejected webhook: bad signature")
-        return JSONResponse({"error": "bad signature"}, status_code=401)
-
     try:
         payload = json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return JSONResponse({"error": "bad json"}, status_code=400)
 
+    destination = payload.get("destination", "")
+    channels = load_channels()
+    if channels:
+        channel = resolve_channel(channels, destination, body, signature)
+        if channel is None:
+            # Never log the secret or the received signature value.
+            return JSONResponse({"error": "bad signature"}, status_code=401)
+    else:
+        # No registry: behave exactly like slice 1.
+        channel = legacy_channel()
+        if not verify_signature(body, signature, get_secret(channel)):
+            log.warning("rejected webhook: bad signature")
+            return JSONResponse({"error": "bad signature"}, status_code=401)
+
+    token = get_token(channel)
     results = []
     for event in payload.get("events", []):
         if event.get("type") != "message":
@@ -324,9 +361,9 @@ async def webhook(request: Request):
             continue
         reply_token = event.get("replyToken", "")
         user_id = event.get("source", {}).get("userId", "")
-        outcome = handle_text(user_id, event.get("message", {}).get("text", ""))
-        send_result = send_reply(reply_token, outcome["messages"])
-        entry = {"outcome": outcome["outcome"]}
+        outcome = handle_text(user_id, event.get("message", {}).get("text", ""), channel)
+        send_result = send_reply(reply_token, outcome["messages"], token)
+        entry = {"outcome": outcome["outcome"], "channel": channel["id"]}
         if DRY_RUN_REPLY:
             # dev/test only: echo the payload that would have been sent
             entry["dev_flex_preview"] = outcome["messages"]
@@ -336,9 +373,9 @@ async def webhook(request: Request):
     return {"ok": True, "events": results}
 
 
-def handle_text(user_id: str, text: str) -> dict:
-    """Core ritual logic. Returns {outcome, messages}."""
-    if not STAMPS_ENABLED:
+def handle_text(user_id: str, text: str, channel: dict) -> dict:
+    """Core ritual logic. Returns {outcome, messages}. Stamp engine untouched."""
+    if not STAMPS_ENABLED or not channel.get("enabled", True):
         return {
             "outcome": "paused",
             "messages": [
@@ -374,6 +411,19 @@ def handle_text(user_id: str, text: str) -> dict:
             ],
         }
 
+    allowed = channel.get("shops")
+    if allowed is not None and shop_code not in allowed:
+        return {
+            "outcome": "not_in_rally",
+            "messages": [
+                text_message(
+                    f"{shop['name_ja']} isn't part of this channel's rally — "
+                    "but your other stamps are safe. Try one of this "
+                    "channel's shops."
+                )
+            ],
+        }
+
     if already_stamped_today(user_id, shop_code):
         return {
             "outcome": "duplicate",
@@ -387,5 +437,8 @@ def handle_text(user_id: str, text: str) -> dict:
         }
 
     total = record_stamp(user_id, shop_code)
-    log.info("stamp recorded: shop=%s total=%d", shop_code, total)
-    return {"outcome": "stamped", "messages": [build_stamp_flex(shop, total)]}
+    log.info("stamp recorded: shop=%s total=%d channel=%s", shop_code, total, channel["id"])
+    return {
+        "outcome": "stamped",
+        "messages": [build_stamp_flex(shop, total, channel.get("theme"))],
+    }

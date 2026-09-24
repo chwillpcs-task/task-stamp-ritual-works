@@ -3,3 +3,4 @@ uvicorn==0.53.0
 httpx==0.28.1
 qrcode==8.2
 pillow==12.3.0
+requests==2.32.3

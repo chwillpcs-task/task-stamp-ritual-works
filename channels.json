@@ -1,0 +1,1 @@
+{"channels":[{"basic_id":"@664ickdm","destination":"","display_name":"TASK Community","enabled":true,"id":"task-community","secret_env":"CHANNEL_SECRET","shops":null,"theme":{"accent":"#E8A33D","header":"TASK スタンプ","sato_line":"A quiet moment worth remembering doesn't need fanfare — just fresh milk and where you stand."},"token_env":"CHANNEL_ACCESS_TOKEN"}]}
